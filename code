@@ -1,0 +1,166 @@
+/*
+  Water Level Monitor — Level 2 + 3
+  Hardware : ESP32 + HC-SR04 + Relay + LED
+  Cloud    : Blynk IoT (v2 / modern template)
+
+  Blynk Virtual Pins used:
+    V0  → Water level % (gauge / display widget)
+    V1  → Distance in cm (value display)
+    V2  → Relay/pump status (LED widget)
+
+  Notifications:
+    Alert 1  – Water level > 80 %   (tank nearly full / pump ON)
+    Alert 2  – Tank empty (level ≈ 0 %)
+    Alert 3  – Sensor failure (echo timeout)
+*/
+
+// ─── 1. Blynk credentials ────────────────────────────────────────────────────
+#define BLYNK_TEMPLATE_ID   "TMPL3_Gly6was"   // ← paste from Blynk console
+#define BLYNK_TEMPLATE_NAME "WaterLevel"
+#define BLYNK_AUTH_TOKEN    "IvMVSkqh7r2oMLfxJrzcPlG5kPZvU6tO"  // ← paste from Blynk console
+
+// ─── 2. Libraries ────────────────────────────────────────────────────────────
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// ─── 3. Wi-Fi credentials ────────────────────────────────────────────────────
+char ssid[] = "vivo Y33s";
+char pass[] = "No123456";
+
+// ─── 4. Pin definitions ──────────────────────────────────────────────────────
+#define TRIG_PIN      13
+#define ECHO_PIN      12
+#define RELAY_PIN      4
+#define LED_PIN       32
+
+// ─── 5. Constants ────────────────────────────────────────────────────────────
+#define MAX_DISTANCE  100   // cm — HC-SR04 effective range
+#define HIGH_LEVEL_THRESHOLD  80  // % — Alert 1 trigger
+#define EMPTY_LEVEL_THRESHOLD  5  // % — Alert 2 trigger (small margin for noise)
+#define SEND_INTERVAL  5000       // ms between readings
+#define NOTIFY_COOLDOWN 60000     // ms between repeat notifications (1 min)
+
+// ─── 6. State tracking ───────────────────────────────────────────────────────
+BlynkTimer timer;
+
+bool prevHigh   = false;
+bool prevEmpty  = false;
+bool prevFail   = false;
+
+unsigned long lastHighNotify  = 0;
+unsigned long lastEmptyNotify = 0;
+unsigned long lastFailNotify  = 0;
+
+// ─── 7. Sensor read + send to Blynk ─────────────────────────────────────────
+void readAndSend() {
+
+  // --- Trigger pulse ---
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);  // 30 ms timeout
+
+  // ── Alert 3: Sensor failure ───────────────────────────────────────────────
+  if (duration == 0) {
+    Serial.println("[WARN] No echo — sensor failure or out of range");
+
+    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
+
+    Blynk.virtualWrite(V0, 0);
+    Blynk.virtualWrite(V2, 0);  // relay widget OFF
+
+    unsigned long now = millis();
+    if (!prevFail || (now - lastFailNotify > NOTIFY_COOLDOWN)) {
+      Blynk.logEvent("sensor_failure",
+        "⚠️ Sensor failure! No echo received. Check wiring.");
+      lastFailNotify = now;
+    }
+    prevFail  = true;
+    prevHigh  = false;
+    prevEmpty = false;
+    return;
+  }
+
+  prevFail = false;
+
+  // --- Calculate ---
+  long distance  = duration * 0.034 / 2;
+  int  level_pct = map(distance, 0, MAX_DISTANCE, 100, 0);
+  level_pct      = constrain(level_pct, 0, 100);
+
+  Serial.printf("[INFO] Distance: %ld cm | Level: %d %%\n", distance, level_pct);
+
+  // --- Push to Blynk dashboard ---
+  Blynk.virtualWrite(V0, level_pct);
+  Blynk.virtualWrite(V1, distance);
+
+  // ── Alert 1: High water (≥ 80 %) ─────────────────────────────────────────
+  if (level_pct >= HIGH_LEVEL_THRESHOLD) {
+    digitalWrite(RELAY_PIN, HIGH);
+    digitalWrite(LED_PIN,   HIGH);
+    Blynk.virtualWrite(V2, 1);  // relay widget ON
+
+    unsigned long now = millis();
+    if (!prevHigh || (now - lastHighNotify > NOTIFY_COOLDOWN)) {
+      Blynk.logEvent("high_water",
+        String("🚨 High water! Level is ") + level_pct + "%. Pump ON.");
+      lastHighNotify = now;
+    }
+    prevHigh  = true;
+    prevEmpty = false;
+
+  // ── Alert 2: Tank empty (≤ 5 %) ──────────────────────────────────────────
+  } else if (level_pct <= EMPTY_LEVEL_THRESHOLD) {
+    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(LED_PIN,   LOW);
+    Blynk.virtualWrite(V2, 0);
+
+    unsigned long now = millis();
+    if (!prevEmpty || (now - lastEmptyNotify > NOTIFY_COOLDOWN)) {
+      Blynk.logEvent("tank_empty",
+        "💧 Tank is empty! Please refill.");
+      lastEmptyNotify = now;
+    }
+    prevEmpty = true;
+    prevHigh  = false;
+
+  // ── Normal range ──────────────────────────────────────────────────────────
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(LED_PIN,   LOW);
+    Blynk.virtualWrite(V2, 0);
+    prevHigh  = false;
+    prevEmpty = false;
+  }
+}
+
+// ─── 8. Setup ────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN,  OUTPUT);
+  pinMode(ECHO_PIN,  INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_PIN,   OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(LED_PIN,   LOW);
+
+  Serial.println("Connecting to Blynk...");
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // Run readAndSend() every SEND_INTERVAL ms
+  timer.setInterval(SEND_INTERVAL, readAndSend);
+
+  Serial.println("Setup complete.");
+}
+
+// ─── 9. Loop ─────────────────────────────────────────────────────────────────
+void loop() {
+  Blynk.run();
+  timer.run();
+}
